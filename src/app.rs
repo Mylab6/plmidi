@@ -23,9 +23,11 @@ const DEFAULT_SOUNDFONT: &str = {
 pub fn new() -> Command<'static> {
 	cfg_if! {
 		if #[cfg(feature = "system")] {
-			let files = arg!([file] ... "MIDI (*.mid) files to play.").required_unless_present("list");
+			let files = arg!([file] ... "MIDI (*.mid) files to play.")
+				.required_unless_present_any(&["list", "gui"]);
 		} else {
-			let files = arg!(<file> ... "MIDI (*.mid) files to play.");
+			let files = arg!([file] ... "MIDI (*.mid) files to play.")
+				.required_unless_present("gui");
 		}
 	}
 
@@ -77,6 +79,11 @@ pub fn new() -> Command<'static> {
 			c
 		}
 	}
+}
+
+#[cfg(feature = "gui")]
+pub fn with_gui(c: clap::Command<'static>) -> clap::Command<'static> {
+	c.arg(arg!(-g --gui "Open the graphical user interface for playback control."))
 }
 
 fn validate<T: std::str::FromStr>(msg: &'static str) -> impl Fn(&str) -> Result<(), String> {

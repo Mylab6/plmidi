@@ -23,10 +23,12 @@ system-winrt = ["system", "nodi/midir-winrt"]
 fluid = ["fluidlite/pkg-config", "cpal", "parking_lot", "clap/env"]
 fluid-bundled = ["fluidlite/builtin", "cpal", "parking_lot", "clap/env"]
 fluid-use-bindgen = ["fluidlite/bindgen"]
+gui = ["eframe", "rfd"]
 
 [dependencies]
 # Optional dependencies
 cpal = { version = "0.15.2", optional = true }
+eframe = { version = "0.27.2", optional = true, default-features = false, features = ["default_fonts", "glow"] }
 fluidlite = { version = "0.2.1", optional = true, features = ["static"] }
 parking_lot = { version = "0.12.1", optional = true }
 
@@ -40,3 +42,4 @@ simple_logger = { version = "4.3.3", default-features = false, features = ["stde
 rand = "0.8.5"
 wild = "2.2.0"
 cfg-if = "1.0.0"
+rfd = { version = "0.10.0", optional = true }

@@ -6,6 +6,12 @@ use std::{
 	time::Duration,
 };
 
+#[cfg(feature = "gui")]
+use std::sync::{
+	Arc,
+	Mutex,
+};
+
 use crossterm::{
 	terminal::{
 		is_raw_mode_enabled,
@@ -32,7 +38,10 @@ use crate::{
 	Command,
 };
 
-fn format_duration(t: Duration) -> String {
+#[cfg(feature = "gui")]
+use crate::PlaybackState;
+
+pub(crate) fn format_duration(t: Duration) -> String {
 	let secs = t.as_secs();
 	let mins = secs / 60;
 	let secs = secs % 60;
@@ -88,54 +97,157 @@ fn gen_header(tracks: &[Track], speed: f32) -> String {
 		"Playing {n} track{s}
 Total duration: {total}
 Press the spacebar to play/pause, ctrl-left/right to play previous/next track
-Press the esc key or ctrl-c to exit",
+Press +/- to adjust the playback speed. Press the esc key or ctrl-c to exit",
 		n = tracks.len(),
 		s = if tracks.len() == 1 { "" } else { "s" },
 		total = format_duration(dur)
 	)
 }
 
+fn gen_status_line(track: &Track, speed: f32, bpm: Option<f64>) -> String {
+	let dur = Duration::from_micros((track.duration.as_micros() as f64 * speed as f64) as u64);
+	let bpm_str = match bpm {
+		Some(b) => format!(" | {:.0} BPM", b),
+		None => String::new(),
+	};
+	format!(
+		"Duration = {} | Speed: {:.1}x{}",
+		format_duration(dur),
+		speed,
+		bpm_str,
+	)
+}
+
+fn make_display(
+	header: &str,
+	track: &Track,
+	n_track: usize,
+	total: usize,
+	speed: f32,
+	bpm: Option<f64>,
+) -> String {
+	format!(
+		"{header}
+Current: {name} [{n}/{total}]
+{status}",
+		name = track.name,
+		n = n_track + 1,
+		status = gen_status_line(track, speed, bpm),
+	)
+}
+
 pub(crate) fn play<C: Connection>(
 	mut con: C,
-	tracks: &[Track],
+	mut tracks: Vec<Track>,
 	mut commands: Receiver<Command>,
 	repeat: bool,
-	speed: f32,
+	mut speed: f32,
+	#[cfg(feature = "gui")] state: Option<Arc<Mutex<PlaybackState>>>,
+	#[cfg(not(feature = "gui"))] _state: Option<()>,
 ) {
-	let header = gen_header(tracks, speed);
+	// Helper macro: publish state to the GUI when the feature is enabled.
+	macro_rules! publish {
+		($state:expr, $n_track:expr, $speed:expr, $bpm:expr, $paused:expr) => {
+			#[cfg(feature = "gui")]
+			if let Some(ref s) = $state {
+				if let Ok(mut g) = s.lock() {
+					g.track_index = $n_track;
+					g.speed = $speed;
+					g.bpm = $bpm;
+					g.paused = $paused;
+				}
+			}
+		};
+	}
+
 	let mut n_track = 0;
 
 	'outer: loop {
 		// Reset the synth.
 		con.send_sys_rt(SystemRealtime::Reset);
-		// System synths seem to ignore the above so at least turn all ntoes off.
+		// System synths seem to ignore the above so at least turn all notes off.
 		con.all_notes_off();
 
 		let mut counter = 0_u32;
+		if tracks.is_empty() {
+			// Nothing to play: wait for a load command or exit when commands end.
+			loop {
+				match commands.try_next() {
+					Err(_) => (),
+					Ok(None) => return,
+					#[cfg(feature = "gui")]
+					Ok(Some(Command::Load(new_tracks))) => {
+						if !new_tracks.is_empty() {
+							tracks = new_tracks;
+							n_track = 0;
+							break; // proceed to play the newly loaded track
+						}
+					}
+					Ok(Some(_)) => (),
+				}
+				// Small sleep to avoid busy loop; block_on next would stall play loop.
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+		}
+
 		let track = &tracks[n_track];
 		let mut timer = Ticker::new(track.tpb);
 		timer.speed = speed;
-		let dur = Duration::from_micros((track.duration.as_micros() as f64 * speed as f64) as u64);
-		Print::ReplaceAll.print(&format!(
-			"{header}
-Current: {name} [{n_track}/{total}]
-Duration = {dur}",
-			n_track = n_track + 1,
-			total = tracks.len(),
-			name = track.name,
-			dur = format_duration(dur),
-		));
+
+		let mut current_bpm: Option<f64> = None;
+		let header = gen_header(&tracks, speed);
+		Print::ReplaceAll.print(&make_display(&header, track, n_track, tracks.len(), speed, current_bpm));
+		publish!(state, n_track, speed, current_bpm, false);
 
 		let mut paused = false;
 
-		for moment in track.sheet.iter() {
+		'track: for moment in track.sheet.iter() {
 			match commands.try_next() {
 				Err(_) => (),
 				Ok(None) => break 'outer,
-				Ok(Some(Command::Next)) => break,
+				Ok(Some(Command::Next)) => break 'track,
 				Ok(Some(Command::Prev)) => {
 					n_track = n_track.saturating_sub(1);
 					continue 'outer;
+				}
+				Ok(Some(Command::SpeedUp)) => {
+					speed = (speed + 0.1).min(10.0);
+					timer.speed = speed;
+					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
+					publish!(state, n_track, speed, current_bpm, false);
+				}
+				Ok(Some(Command::SpeedDown)) => {
+					speed = (speed - 0.1).max(0.1);
+					timer.speed = speed;
+					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
+					publish!(state, n_track, speed, current_bpm, false);
+				}
+				Ok(Some(Command::SetSpeed(s))) => {
+					speed = s.clamp(0.1, 10.0);
+					timer.speed = speed;
+					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
+					publish!(state, n_track, speed, current_bpm, false);
+				}
+				#[cfg(feature = "gui")]
+				Ok(Some(Command::Load(new_tracks))) => {
+					if !new_tracks.is_empty() {
+						// replace playlist and restart at first track
+						tracks = new_tracks;
+						n_track = 0;
+						// update GUI playlist if present
+						if let Some(ref s) = state {
+							if let Ok(mut g) = s.lock() {
+								g.playlist = tracks
+									.iter()
+									.map(|t| (t.name.clone(), t.duration))
+									.collect::<Vec<_>>();
+								g.track_index = 0;
+								g.paused = false;
+								g.done = false;
+							}
+						}
+						break 'track;
+					}
 				}
 				Ok(Some(Command::Pause)) => {
 					con.all_notes_off();
@@ -145,16 +257,70 @@ Duration = {dur}",
 						Print::Append.print("paused");
 						paused = true;
 					}
-					// Wait for the next command.
-					match block_on(commands.next()) {
-						None => break 'outer,
-						Some(Command::Pause) => Print::ReplaceLast.print("unpaused"),
-						Some(Command::Next) => break,
-						Some(Command::Prev) => {
-							n_track = n_track.saturating_sub(1);
-							continue 'outer;
+					publish!(state, n_track, speed, current_bpm, true);
+					// Wait for the next command, allowing speed changes while paused.
+					loop {
+						match block_on(commands.next()) {
+							None => break 'outer,
+							Some(Command::Pause) => break,
+							Some(Command::Next) => break 'track,
+							Some(Command::Prev) => {
+								n_track = n_track.saturating_sub(1);
+								continue 'outer;
+							}
+							Some(Command::Load(new_tracks)) => {
+								if !new_tracks.is_empty() {
+									tracks = new_tracks;
+									n_track = 0;
+									if let Some(ref s) = state {
+										if let Ok(mut g) = s.lock() {
+											g.playlist = tracks
+												.iter()
+												.map(|t| (t.name.clone(), t.duration))
+												.collect::<Vec<_>>();
+											g.track_index = 0;
+											g.paused = false;
+											g.done = false;
+										}
+									}
+									break 'track;
+								}
+							},
+							Some(Command::SpeedUp) => {
+								speed = (speed + 0.1).min(10.0);
+								timer.speed = speed;
+								Print::ReplaceLast
+									.print(&format!("paused | Speed: {:.1}x", speed));
+								publish!(state, n_track, speed, current_bpm, true);
+							}
+							Some(Command::SpeedDown) => {
+								speed = (speed - 0.1).max(0.1);
+								timer.speed = speed;
+								Print::ReplaceLast
+									.print(&format!("paused | Speed: {:.1}x", speed));
+								publish!(state, n_track, speed, current_bpm, true);
+							}
+							Some(Command::SetSpeed(s)) => {
+								speed = s.clamp(0.1, 10.0);
+								timer.speed = speed;
+								Print::ReplaceLast
+									.print(&format!("paused | Speed: {:.1}x", speed));
+								publish!(state, n_track, speed, current_bpm, true);
+							}
 						}
 					}
+
+					// Redraw the full display after unpausing to show updated speed/BPM.
+					let header = gen_header(&tracks, speed);
+					Print::ReplaceAll.print(&make_display(
+						&header,
+						track,
+						n_track,
+						tracks.len(),
+						speed,
+						current_bpm,
+					));
+					publish!(state, n_track, speed, current_bpm, false);
 				}
 			};
 
@@ -165,7 +331,16 @@ Duration = {dur}",
 			}
 			for event in &moment.events {
 				match event {
-					Event::Tempo(val) => timer.change_tempo(*val),
+					Event::Tempo(val) => {
+						timer.change_tempo(*val);
+						let new_bpm = 60_000_000.0 / *val as f64;
+						if current_bpm.map_or(true, |b| (b - new_bpm).abs() >= 0.5) {
+							current_bpm = Some(new_bpm);
+							Print::ReplaceLast
+								.print(&gen_status_line(track, speed, current_bpm));
+							publish!(state, n_track, speed, current_bpm, false);
+						}
+					}
 					Event::Midi(msg) => {
 						con.play(*msg);
 					}
@@ -189,4 +364,10 @@ Duration = {dur}",
 
 	con.send_sys_rt(SystemRealtime::Reset);
 	con.all_notes_off();
+	#[cfg(feature = "gui")]
+	if let Some(ref s) = state {
+		if let Ok(mut g) = s.lock() {
+			g.done = true;
+		}
+	}
 }
