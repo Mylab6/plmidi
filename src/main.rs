@@ -4,6 +4,8 @@ compile_error!("you must enable at least one of fluid, fluid-bundled or system c
 mod app;
 #[cfg(feature = "fluidlite")]
 mod fluid;
+#[cfg(feature = "gui")]
+mod gui;
 mod playback;
 mod track;
 
@@ -13,6 +15,12 @@ use std::{
 	},
 	process,
 	thread,
+};
+
+#[cfg(feature = "gui")]
+use std::sync::{
+	Arc,
+	Mutex,
 };
 
 use cfg_if::cfg_if;
@@ -66,12 +74,26 @@ enum Command {
 	Prev,
 	SpeedUp,
 	SpeedDown,
+	#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+	SetSpeed(f32),
 }
 
 #[cfg(all(feature = "fluidlite", feature = "system"))]
 enum Either<A, B> {
 	Left(A),
 	Right(B),
+}
+
+/// Shared playback state written by the playback thread and read by the GUI.
+#[cfg(feature = "gui")]
+pub struct PlaybackState {
+	/// Playlist entries: (track name, duration). Set once before the playback thread starts.
+	pub playlist: Vec<(String, std::time::Duration)>,
+	pub track_index: usize,
+	pub speed: f32,
+	pub bpm: Option<f64>,
+	pub paused: bool,
+	pub done: bool,
 }
 
 fn init_logger(n: u64) -> Result<(), log::SetLoggerError> {
@@ -148,7 +170,12 @@ fn get_midi(n: usize) -> Result<MidiOutputConnection> {
 }
 
 fn run() -> Result<()> {
-	let m = app::new().get_matches_from(wild::args());
+	#[cfg(feature = "gui")]
+	let cmd = app::with_gui(app::new());
+	#[cfg(not(feature = "gui"))]
+	let cmd = app::new();
+
+	let m = cmd.get_matches_from(wild::args());
 	#[cfg(feature = "system")]
 	if m.is_present("list") {
 		return list_devices();
@@ -161,20 +188,12 @@ fn run() -> Result<()> {
 	let shuffle = m.is_present("shuffle");
 	let transpose = m.value_of_t_or_exit::<i8>("transpose");
 
-	cfg_if! {
-		if #[cfg(all(feature = "fluidlite", feature = "system"))] {
-				let con = match m.value_of_t::<usize>("device") {
-		Err(_) => Either::Left(fluid::Fluid::new(m.value_of("fluid").unwrap())?),
-		Ok(n) => Either::Right(get_midi(n)?),
-	};
-		} else if #[cfg(feature = "fluidlite")] {
-			let con = fluid::Fluid::new(m.value_of("fluid").unwrap())?;
-		} else if #[cfg(feature = "system")] {
-			let con = get_midi(m.value_of_t_or_exit("device"))?;
-		} else {
-			compile_error!("you must enable at least one of fluid, fluid-bundled or system cargo features");
-		}
-	}
+	// Extract connection-init params as owned, Send values so they can be moved
+	// into a background thread if GUI mode is requested.
+	#[cfg(feature = "fluidlite")]
+	let soundfont = m.value_of("fluid").unwrap().to_string();
+	#[cfg(feature = "system")]
+	let device_arg = m.value_of_t::<usize>("device");
 
 	let mut tracks = m
 		.values_of("file")
@@ -191,6 +210,100 @@ fn run() -> Result<()> {
 		tracks.shuffle(&mut rand::thread_rng());
 	}
 
+	// ── GUI mode ─────────────────────────────────────────────────────────────
+	// When the `gui` feature is compiled in and the user passes `--gui`, spawn
+	// playback on a background thread and run the egui window on the main thread.
+	// The connection (fluid::Fluid / midir) is created INSIDE the background
+	// thread because cpal::Stream is !Send on some platforms.
+	#[cfg(feature = "gui")]
+	if m.is_present("gui") {
+		use std::sync::mpsc as sync_mpsc;
+
+		let playlist = tracks
+			.iter()
+			.map(|t| (t.name.clone(), t.duration))
+			.collect::<Vec<_>>();
+
+		let state = Arc::new(Mutex::new(PlaybackState {
+			playlist,
+			speed,
+			track_index: 0,
+			bpm: None,
+			paused: false,
+			done: false,
+		}));
+
+		let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(4);
+		let state_clone = Arc::clone(&state);
+		let (init_tx, init_rx) = sync_mpsc::channel::<Result<(), String>>();
+
+		thread::spawn(move || {
+			cfg_if! {
+				if #[cfg(all(feature = "fluidlite", feature = "system"))] {
+					let con_res: Result<Either<fluid::Fluid, _>, String> = match device_arg {
+						Err(_) => fluid::Fluid::new(&soundfont).map(Either::Left).map_err(|e| e.to_string()),
+						Ok(n) => get_midi(n).map(Either::Right).map_err(|e| e.to_string()),
+					};
+					match con_res {
+						Err(e) => { let _ = init_tx.send(Err(e)); }
+						Ok(con) => {
+							let _ = init_tx.send(Ok(()));
+							match con {
+								Either::Left(c) => playback::play(c, &tracks, cmd_rx, repeat, speed, Some(state_clone)),
+								Either::Right(c) => playback::play(c, &tracks, cmd_rx, repeat, speed, Some(state_clone)),
+							}
+						}
+					}
+				} else if #[cfg(feature = "fluidlite")] {
+					match fluid::Fluid::new(&soundfont) {
+						Err(e) => { let _ = init_tx.send(Err(e.to_string())); }
+						Ok(con) => {
+							let _ = init_tx.send(Ok(()));
+							playback::play(con, &tracks, cmd_rx, repeat, speed, Some(state_clone));
+						}
+					}
+				} else if #[cfg(feature = "system")] {
+					// system-only: default_value("0") in app.rs means device_arg is always Ok.
+					match get_midi(device_arg.unwrap_or(0)) {
+						Err(e) => { let _ = init_tx.send(Err(e.to_string())); }
+						Ok(con) => {
+							let _ = init_tx.send(Ok(()));
+							playback::play(con, &tracks, cmd_rx, repeat, speed, Some(state_clone));
+						}
+					}
+				}
+			}
+		});
+
+		// Wait for the playback thread to finish initialization before opening the GUI.
+		match init_rx.recv() {
+			Ok(Ok(())) => {}
+			Ok(Err(e)) => return Err(e.into()),
+			Err(_) => return Err("playback thread did not initialize".into()),
+		}
+
+		return gui::run(state, cmd_tx);
+	}
+
+	// ── TUI mode (default) ────────────────────────────────────────────────────
+	// Create the connection on this thread (no Send requirement).
+	cfg_if! {
+		if #[cfg(all(feature = "fluidlite", feature = "system"))] {
+			let con = match device_arg {
+				Err(_) => Either::Left(fluid::Fluid::new(&soundfont)?),
+				Ok(n) => Either::Right(get_midi(n)?),
+			};
+		} else if #[cfg(feature = "fluidlite")] {
+			let con = fluid::Fluid::new(&soundfont)?;
+		} else if #[cfg(feature = "system")] {
+			// In the system-only build, app.rs sets .default_value("0") on --device,
+			// so device_arg is always Ok. The unwrap_or(0) is a safety fallback only.
+			let con = get_midi(device_arg.unwrap_or(0))?;
+		} else {
+			compile_error!("you must enable at least one of fluid, fluid-bundled or system cargo features");
+		}
+	}
+
 	let (sender, receiver) = mpsc::channel(1);
 
 	let (mut tx_done, rx_done) = mpsc::channel(0);
@@ -199,11 +312,11 @@ fn run() -> Result<()> {
 	cfg_if! {
 		if #[cfg(all(feature = "fluidlite", feature = "system"))] {
 			match con {
-		Either::Left(con) => playback::play(con, &tracks, receiver, repeat, speed),
-		Either::Right(con) => playback::play(con, &tracks, receiver, repeat, speed),
-	}
+				Either::Left(con) => playback::play(con, &tracks, receiver, repeat, speed, None),
+				Either::Right(con) => playback::play(con, &tracks, receiver, repeat, speed, None),
+			}
 		} else {
-			playback::play(con, &tracks, receiver, repeat, speed);
+			playback::play(con, &tracks, receiver, repeat, speed, None);
 		}
 	}
 

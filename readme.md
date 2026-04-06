@@ -20,6 +20,7 @@ Grab a binary for your platform from the [releases page](https://github.com/inso
 - `$PLMIDI_DEFAULT_SOUNDFONT`: (Optional) Path to the default soundfont file. The file doesn't need to exist.
 
 ### Feature Flags
+- `--features=gui`: Enable the egui graphical user interface (adds a `--gui` CLI flag).
 - `--features=system`: Enable playback through MIDI out devices registered on the system.
 - `--features=system-jack`: Same with `system` but uses the Jack backend.
 - `--features=winrt`: Same with `system` except it uses the WinRT backend. Note that currently WinRT does not recognize OmniMidi or Virtual Midi Synth so I wouldn't recommend it.
@@ -62,8 +63,24 @@ cargo install --path . --features system --no-default-features
 
 # Usage
 - `plmidi foo.mid`
+- `plmidi --gui foo.mid` — open the graphical interface (requires `--features=gui` at build time)
 - (If the `system` feature is enabled) `plmidi --device 2 foo.mid`
 - (If the `fluid` feature is enabled) `plmidi --fluidsynth ~/soundfonts/some-soundfont.sf2 foo.mid`
+
+## Graphical Interface (`--gui`)
+When built with `--features=gui` (using [egui](https://github.com/emilk/egui)), passing `--gui` opens a window with:
+- **Now Playing** — current track name and position in the playlist
+- **BPM** — live beats-per-minute read from the MIDI file's tempo events
+- **Transport buttons** — ⏮ Previous, ⏸ Pause/▶ Play, ⏭ Next
+- **Speed slider** — drag or use `−`/`+` buttons to adjust playback speed from 0.1× to 4.0×; "Reset to 1.0×" restores normal tempo
+- **Playlist panel** — collapsible list showing all tracks with durations; the current track is highlighted with ▶
+
+Build with GUI support:
+```shell
+cargo install --path . --features gui
+# or with both the embedded synth and the GUI:
+cargo install --path . --features "fluid-bundled,gui"
+```
 
 ## Keyboard Controls During Playback
 | Key | Action |

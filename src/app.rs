@@ -79,6 +79,11 @@ pub fn new() -> Command<'static> {
 	}
 }
 
+#[cfg(feature = "gui")]
+pub fn with_gui(c: clap::Command<'static>) -> clap::Command<'static> {
+	c.arg(arg!(-g --gui "Open the graphical user interface for playback control."))
+}
+
 fn validate<T: std::str::FromStr>(msg: &'static str) -> impl Fn(&str) -> Result<(), String> {
 	move |s| s.parse::<T>().map(|_| {}).map_err(|_| String::from(msg))
 }

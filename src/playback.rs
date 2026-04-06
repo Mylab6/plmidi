@@ -6,6 +6,12 @@ use std::{
 	time::Duration,
 };
 
+#[cfg(feature = "gui")]
+use std::sync::{
+	Arc,
+	Mutex,
+};
+
 use crossterm::{
 	terminal::{
 		is_raw_mode_enabled,
@@ -32,7 +38,10 @@ use crate::{
 	Command,
 };
 
-fn format_duration(t: Duration) -> String {
+#[cfg(feature = "gui")]
+use crate::PlaybackState;
+
+pub(crate) fn format_duration(t: Duration) -> String {
 	let secs = t.as_secs();
 	let mins = secs / 60;
 	let secs = secs % 60;
@@ -133,7 +142,24 @@ pub(crate) fn play<C: Connection>(
 	mut commands: Receiver<Command>,
 	repeat: bool,
 	mut speed: f32,
+	#[cfg(feature = "gui")] state: Option<Arc<Mutex<PlaybackState>>>,
+	#[cfg(not(feature = "gui"))] _state: Option<()>,
 ) {
+	// Helper macro: publish state to the GUI when the feature is enabled.
+	macro_rules! publish {
+		($state:expr, $n_track:expr, $speed:expr, $bpm:expr, $paused:expr) => {
+			#[cfg(feature = "gui")]
+			if let Some(ref s) = $state {
+				if let Ok(mut g) = s.lock() {
+					g.track_index = $n_track;
+					g.speed = $speed;
+					g.bpm = $bpm;
+					g.paused = $paused;
+				}
+			}
+		};
+	}
+
 	let mut n_track = 0;
 
 	'outer: loop {
@@ -150,6 +176,7 @@ pub(crate) fn play<C: Connection>(
 		let mut current_bpm: Option<f64> = None;
 		let header = gen_header(tracks, speed);
 		Print::ReplaceAll.print(&make_display(&header, track, n_track, tracks.len(), speed, current_bpm));
+		publish!(state, n_track, speed, current_bpm, false);
 
 		let mut paused = false;
 
@@ -166,11 +193,19 @@ pub(crate) fn play<C: Connection>(
 					speed = (speed + 0.1).min(10.0);
 					timer.speed = speed;
 					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
+					publish!(state, n_track, speed, current_bpm, false);
 				}
 				Ok(Some(Command::SpeedDown)) => {
 					speed = (speed - 0.1).max(0.1);
 					timer.speed = speed;
 					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
+					publish!(state, n_track, speed, current_bpm, false);
+				}
+				Ok(Some(Command::SetSpeed(s))) => {
+					speed = s.clamp(0.1, 10.0);
+					timer.speed = speed;
+					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
+					publish!(state, n_track, speed, current_bpm, false);
 				}
 				Ok(Some(Command::Pause)) => {
 					con.all_notes_off();
@@ -180,6 +215,7 @@ pub(crate) fn play<C: Connection>(
 						Print::Append.print("paused");
 						paused = true;
 					}
+					publish!(state, n_track, speed, current_bpm, true);
 					// Wait for the next command, allowing speed changes while paused.
 					loop {
 						match block_on(commands.next()) {
@@ -195,12 +231,21 @@ pub(crate) fn play<C: Connection>(
 								timer.speed = speed;
 								Print::ReplaceLast
 									.print(&format!("paused | Speed: {:.1}x", speed));
+								publish!(state, n_track, speed, current_bpm, true);
 							}
 							Some(Command::SpeedDown) => {
 								speed = (speed - 0.1).max(0.1);
 								timer.speed = speed;
 								Print::ReplaceLast
 									.print(&format!("paused | Speed: {:.1}x", speed));
+								publish!(state, n_track, speed, current_bpm, true);
+							}
+							Some(Command::SetSpeed(s)) => {
+								speed = s.clamp(0.1, 10.0);
+								timer.speed = speed;
+								Print::ReplaceLast
+									.print(&format!("paused | Speed: {:.1}x", speed));
+								publish!(state, n_track, speed, current_bpm, true);
 							}
 						}
 					}
@@ -215,6 +260,7 @@ pub(crate) fn play<C: Connection>(
 						speed,
 						current_bpm,
 					));
+					publish!(state, n_track, speed, current_bpm, false);
 				}
 			};
 
@@ -232,6 +278,7 @@ pub(crate) fn play<C: Connection>(
 							current_bpm = Some(new_bpm);
 							Print::ReplaceLast
 								.print(&gen_status_line(track, speed, current_bpm));
+							publish!(state, n_track, speed, current_bpm, false);
 						}
 					}
 					Event::Midi(msg) => {
@@ -257,4 +304,10 @@ pub(crate) fn play<C: Connection>(
 
 	con.send_sys_rt(SystemRealtime::Reset);
 	con.all_notes_off();
+	#[cfg(feature = "gui")]
+	if let Some(ref s) = state {
+		if let Ok(mut g) = s.lock() {
+			g.done = true;
+		}
+	}
 }
