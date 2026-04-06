@@ -65,5 +65,17 @@ cargo install --path . --features system --no-default-features
 - (If the `system` feature is enabled) `plmidi --device 2 foo.mid`
 - (If the `fluid` feature is enabled) `plmidi --fluidsynth ~/soundfonts/some-soundfont.sf2 foo.mid`
 
+## Keyboard Controls During Playback
+| Key | Action |
+|-----|--------|
+| `Space` | Toggle play / pause |
+| `Ctrl+Left` | Previous track |
+| `Ctrl+Right` | Next track |
+| `+` or `=` | Increase playback speed by 0.1× |
+| `-` | Decrease playback speed by 0.1× |
+| `Esc` / `Ctrl+C` / `Ctrl+Q` | Exit |
+
+The current playback speed and the track's BPM (when available from the MIDI file) are shown in the status line while playing.
+
 ## Known Bugs
 - On windows, the fluidlite backend doesn't seem to respect sample rates, thus rates higher than 441.khz cause pitch-shifted sped-up sounds.

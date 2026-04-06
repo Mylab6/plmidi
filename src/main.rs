@@ -64,6 +64,8 @@ enum Command {
 	Pause,
 	Next,
 	Prev,
+	SpeedUp,
+	SpeedDown,
 }
 
 #[cfg(all(feature = "fluidlite", feature = "system"))]
@@ -248,6 +250,8 @@ async fn listen_keys(mut sender: Sender<Command>, done: Receiver<()>) {
 					sender.send(Command::Next).await.is_err()
 				}
 				KeyCode::Char(' ') => sender.send(Command::Pause).await.is_err(),
+				KeyCode::Char('+' | '=') => sender.send(Command::SpeedUp).await.is_err(),
+				KeyCode::Char('-') => sender.send(Command::SpeedDown).await.is_err(),
 				_ => false,
 			},
 			_ => false,
