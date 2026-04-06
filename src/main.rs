@@ -76,6 +76,8 @@ enum Command {
 	SpeedDown,
 	#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 	SetSpeed(f32),
+	#[cfg(feature = "gui")]
+	Load(Vec<Track>),
 }
 
 #[cfg(all(feature = "fluidlite", feature = "system"))]
@@ -205,7 +207,14 @@ fn run() -> Result<()> {
 	for t in &mut tracks {
 		t.sheet.transpose(transpose, false);
 	}
-
+							Ok(n) => get_midi(n).map(Either::Right).map_err(|e| e.to_string()),
+							Err(_) => {
+								// No --device provided: try system MIDI device 1 first, then fall back to embedded fluid.
+								match get_midi(1) {
+									Ok(c) => Ok(Either::Right(c)),
+									Err(_) => fluid::Fluid::new(&soundfont).map(Either::Left).map_err(|e| e.to_string()),
+								}
+							}
 	if shuffle {
 		tracks.shuffle(&mut rand::thread_rng());
 	}
@@ -245,30 +254,52 @@ fn run() -> Result<()> {
 						Ok(n) => get_midi(n).map(Either::Right).map_err(|e| e.to_string()),
 					};
 					match con_res {
-						Err(e) => { let _ = init_tx.send(Err(e)); }
+						// system-only: default to device 1 when not specified for GUI convenience.
+						match get_midi(device_arg.unwrap_or(1)) {
+							// Try to fall back to system MIDI if available.
+							#[cfg(feature = "system")]
+							match get_midi(device_arg.unwrap_or(0)) {
+								Ok(con) => {
+									let _ = init_tx.send(Ok(()));
+									playback::play(con, tracks, cmd_rx, repeat, speed, Some(state_clone));
+								}
+								Err(e) => {
+									log::warn!("failed to open MIDI device fallback: {}", e);
+									let _ = init_tx.send(Ok(()));
+								}
+							}
+							#[cfg(not(feature = "system"))]
+							let _ = init_tx.send(Ok(()));
+						}
 						Ok(con) => {
 							let _ = init_tx.send(Ok(()));
 							match con {
-								Either::Left(c) => playback::play(c, &tracks, cmd_rx, repeat, speed, Some(state_clone)),
-								Either::Right(c) => playback::play(c, &tracks, cmd_rx, repeat, speed, Some(state_clone)),
+								Either::Left(c) => playback::play(c, tracks, cmd_rx, repeat, speed, Some(state_clone)),
+								Either::Right(c) => playback::play(c, tracks, cmd_rx, repeat, speed, Some(state_clone)),
 							}
 						}
 					}
 				} else if #[cfg(feature = "fluidlite")] {
 					match fluid::Fluid::new(&soundfont) {
-						Err(e) => { let _ = init_tx.send(Err(e.to_string())); }
+						Err(e) => {
+							log::warn!("failed to load soundfont: {}", e.to_string());
+							let _ = init_tx.send(Ok(()));
+						}
 						Ok(con) => {
 							let _ = init_tx.send(Ok(()));
-							playback::play(con, &tracks, cmd_rx, repeat, speed, Some(state_clone));
+							playback::play(con, tracks, cmd_rx, repeat, speed, Some(state_clone));
 						}
 					}
 				} else if #[cfg(feature = "system")] {
 					// system-only: default_value("0") in app.rs means device_arg is always Ok.
 					match get_midi(device_arg.unwrap_or(0)) {
-						Err(e) => { let _ = init_tx.send(Err(e.to_string())); }
+						Err(e) => {
+							log::warn!("failed to open MIDI device: {}", e.to_string());
+							let _ = init_tx.send(Ok(()));
+						}
 						Ok(con) => {
 							let _ = init_tx.send(Ok(()));
-							playback::play(con, &tracks, cmd_rx, repeat, speed, Some(state_clone));
+							playback::play(con, tracks, cmd_rx, repeat, speed, Some(state_clone));
 						}
 					}
 				}
@@ -312,11 +343,11 @@ fn run() -> Result<()> {
 	cfg_if! {
 		if #[cfg(all(feature = "fluidlite", feature = "system"))] {
 			match con {
-				Either::Left(con) => playback::play(con, &tracks, receiver, repeat, speed, None),
-				Either::Right(con) => playback::play(con, &tracks, receiver, repeat, speed, None),
+				Either::Left(con) => playback::play(con, tracks, receiver, repeat, speed, None),
+				Either::Right(con) => playback::play(con, tracks, receiver, repeat, speed, None),
 			}
 		} else {
-			playback::play(con, &tracks, receiver, repeat, speed, None);
+			playback::play(con, tracks, receiver, repeat, speed, None);
 		}
 	}
 

@@ -138,7 +138,7 @@ Current: {name} [{n}/{total}]
 
 pub(crate) fn play<C: Connection>(
 	mut con: C,
-	tracks: &[Track],
+	mut tracks: Vec<Track>,
 	mut commands: Receiver<Command>,
 	repeat: bool,
 	mut speed: f32,
@@ -169,12 +169,33 @@ pub(crate) fn play<C: Connection>(
 		con.all_notes_off();
 
 		let mut counter = 0_u32;
+		if tracks.is_empty() {
+			// Nothing to play: wait for a load command or exit when commands end.
+			loop {
+				match commands.try_next() {
+					Err(_) => (),
+					Ok(None) => return,
+					#[cfg(feature = "gui")]
+					Ok(Some(Command::Load(new_tracks))) => {
+						if !new_tracks.is_empty() {
+							tracks = new_tracks;
+							n_track = 0;
+							break; // proceed to play the newly loaded track
+						}
+					}
+					Ok(Some(_)) => (),
+				}
+				// Small sleep to avoid busy loop; block_on next would stall play loop.
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+		}
+
 		let track = &tracks[n_track];
 		let mut timer = Ticker::new(track.tpb);
 		timer.speed = speed;
 
 		let mut current_bpm: Option<f64> = None;
-		let header = gen_header(tracks, speed);
+		let header = gen_header(&tracks, speed);
 		Print::ReplaceAll.print(&make_display(&header, track, n_track, tracks.len(), speed, current_bpm));
 		publish!(state, n_track, speed, current_bpm, false);
 
@@ -207,6 +228,27 @@ pub(crate) fn play<C: Connection>(
 					Print::ReplaceLast.print(&gen_status_line(track, speed, current_bpm));
 					publish!(state, n_track, speed, current_bpm, false);
 				}
+				#[cfg(feature = "gui")]
+				Ok(Some(Command::Load(new_tracks))) => {
+					if !new_tracks.is_empty() {
+						// replace playlist and restart at first track
+						tracks = new_tracks;
+						n_track = 0;
+						// update GUI playlist if present
+						if let Some(ref s) = state {
+							if let Ok(mut g) = s.lock() {
+								g.playlist = tracks
+									.iter()
+									.map(|t| (t.name.clone(), t.duration))
+									.collect::<Vec<_>>();
+								g.track_index = 0;
+								g.paused = false;
+								g.done = false;
+							}
+						}
+						break 'track;
+					}
+				}
 				Ok(Some(Command::Pause)) => {
 					con.all_notes_off();
 					if paused {
@@ -226,6 +268,24 @@ pub(crate) fn play<C: Connection>(
 								n_track = n_track.saturating_sub(1);
 								continue 'outer;
 							}
+							Some(Command::Load(new_tracks)) => {
+								if !new_tracks.is_empty() {
+									tracks = new_tracks;
+									n_track = 0;
+									if let Some(ref s) = state {
+										if let Ok(mut g) = s.lock() {
+											g.playlist = tracks
+												.iter()
+												.map(|t| (t.name.clone(), t.duration))
+												.collect::<Vec<_>>();
+											g.track_index = 0;
+											g.paused = false;
+											g.done = false;
+										}
+									}
+									break 'track;
+								}
+							},
 							Some(Command::SpeedUp) => {
 								speed = (speed + 0.1).min(10.0);
 								timer.speed = speed;
@@ -251,7 +311,7 @@ pub(crate) fn play<C: Connection>(
 					}
 
 					// Redraw the full display after unpausing to show updated speed/BPM.
-					let header = gen_header(tracks, speed);
+					let header = gen_header(&tracks, speed);
 					Print::ReplaceAll.print(&make_display(
 						&header,
 						track,

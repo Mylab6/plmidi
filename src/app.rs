@@ -23,9 +23,11 @@ const DEFAULT_SOUNDFONT: &str = {
 pub fn new() -> Command<'static> {
 	cfg_if! {
 		if #[cfg(feature = "system")] {
-			let files = arg!([file] ... "MIDI (*.mid) files to play.").required_unless_present("list");
+			let files = arg!([file] ... "MIDI (*.mid) files to play.")
+				.required_unless_present_any(&["list", "gui"]);
 		} else {
-			let files = arg!(<file> ... "MIDI (*.mid) files to play.");
+			let files = arg!([file] ... "MIDI (*.mid) files to play.")
+				.required_unless_present("gui");
 		}
 	}
 

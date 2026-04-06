@@ -11,6 +11,8 @@ use crate::{
 	Command,
 	PlaybackState,
 };
+use crate::track::Track;
+use rfd::FileDialog;
 
 /// Run the egui/eframe GUI. Blocks until the window is closed.
 pub fn run(
@@ -110,6 +112,24 @@ impl eframe::App for PlmidiApp {
 
 			// ── Transport controls ────────────────────────────────────────
 			ui.horizontal(|ui| {
+				if ui.small_button("Open...").clicked() {
+					if let Some(paths) = FileDialog::new()
+						.add_filter("MIDI", &["mid", "midi"])
+						.set_title("Open MIDI files")
+						.pick_files()
+					{
+						let mut new_tracks = Vec::new();
+						for p in paths {
+							match Track::new(&p) {
+								Ok(t) => new_tracks.push(t),
+								Err(e) => log::error!("failed to load {}: {}", p.display(), e),
+							}
+						}
+						if !new_tracks.is_empty() {
+							self.send(Command::Load(new_tracks));
+						}
+					}
+				}
 				if ui.button("⏮  Prev").clicked() {
 					self.send(Command::Prev);
 				}
